@@ -29,7 +29,8 @@
   <h1>Quiet Summit</h1>
   <p>Sit on a mountaintop at sunrise. The sun's glow and the wind swell and fade at a slow
     breathing pace: follow them if you like, or just look out over the valley.</p>
-  <div id="lengths">
+  <p id="loading">Preparing the mountain…</p>
+  <div id="lengths" hidden>
     <button data-min="5">5 minutes</button>
     <button data-min="10">10 minutes</button>
     <button data-min="20">20 minutes</button>
@@ -59,37 +60,58 @@ function breath(t) {
   }
 }
 
-// ---------- landscape maths (deterministic: the same mountain every visit) ----------
+// ---------- landscape maths (deterministic: the same mountain on every device) ----------
 const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
 const sm = (a, b, x) => { x = clamp((x - a) / (b - a)); return x * x * (3 - 2 * x); };
-const hash = (i, j) => { const s = Math.sin(i * 127.1 + j * 311.7) * 43758.5453; return s - Math.floor(s); };
-function noise(x, y) {
+const hash = (i, j) => {
+  let h = (Math.imul(i, 374761393) + Math.imul(j, 668265263)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+};
+// Value noise. Pass a period P (in lattice cells) to make it tile.
+function noise(x, y, P = 0) {
   const i = Math.floor(x), j = Math.floor(y), u = x - i, w = y - j;
   const a = u * u * (3 - 2 * u), b = w * w * (3 - 2 * w);
-  const top = hash(i, j) + (hash(i + 1, j) - hash(i, j)) * a;
-  const bot = hash(i, j + 1) + (hash(i + 1, j + 1) - hash(i, j + 1)) * a;
+  let i0 = i, i1 = i + 1, j0 = j, j1 = j + 1;
+  if (P) { i0 = ((i % P) + P) % P; i1 = (i0 + 1) % P; j0 = ((j % P) + P) % P; j1 = (j0 + 1) % P; }
+  const h00 = hash(i0, j0), h01 = hash(i0, j1);
+  const top = h00 + (hash(i1, j0) - h00) * a, bot = h01 + (hash(i1, j1) - h01) * a;
   return top + (bot - top) * b;
 }
-function fbm(x, y, octaves = 5) {
+function fbm(x, y, octaves = 5, P = 0) {
   let s = 0, amp = 0.5;
-  for (let o = 0; o < octaves; o++) { s += amp * noise(x, y); x *= 2.03; y *= 2.03; amp *= 0.5; }
+  for (let o = 0; o < octaves; o++) { s += amp * noise(x, y, P); x = x * 2 + 19.19; y = y * 2 + 7.77; P *= 2; amp *= 0.5; }
   return s / (1 - amp * 2);
 }
 
-const WATER = -430; // lake level; you sit at y = 0
+// Ridged multifractal: sharp crests that carry the fine detail, smooth valleys between them.
+function ridged(x, y) {
+  let s = 0, amp = 0.5, w = 1;
+  for (let o = 0; o < 6; o++) {
+    let n = 1 - Math.abs(2 * noise(x, y) - 1);
+    n *= n; s += amp * n * w; w = clamp(n * 1.6);
+    x = x * 2 + 19.19; y = y * 2 + 7.77; amp *= 0.5;
+  }
+  return s;
+}
+
+const WATER = -418; // lake level; you sit at y = 0
 // Your peak at the origin dropping steeply to a valley ring, then far ranges at about eye level.
 function height(x, z) {
   const r = Math.hypot(x, z);
-  const ridge = 1 - Math.abs(2 * fbm(x / 900 + 7, z / 900 + 3, 3) - 1);
+  const wx = x + 260 * (fbm(x / 1100 + 1.7, z / 1100 + 9.2, 2) - 0.5);
+  const wz = z + 260 * (fbm(x / 1100 + 5.1, z / 1100 + 3.3, 2) - 0.5);
+  const big = 0.55 + 0.9 * fbm(x / 2300 + 13, z / 2300 + 29, 2); // some massifs tower, some stay low
   return -25 - 395 * (1 - Math.exp(-r / 400))
-    + (fbm(x / 600, z / 600) - 0.5) * 160 * sm(60, 500, r)
-    + (100 + 800 * ridge * ridge) * sm(1500, 2700, r);
+    + (fbm(x / 600, z / 600, 6) - 0.5) * 400 * sm(60, 500, r)
+    + (100 + 950 * ridged(wx / 1000 + 7, wz / 1000 + 3) * big) * sm(1500, 2700, r);
 }
 
 if (location.hash === '#test') {
   const eq = (a, b) => { if (Math.abs(a - b) > 1e-9) throw new Error(`check: ${a} != ${b}`); };
   eq(breath(0), 0); eq(breath(2), 0.5); eq(breath(5), 1); eq(breath(9), 0.5); eq(breath(CYCLE + 2), 0.5);
   eq(height(0, 0), -25);
+  eq(noise(3.3, 9.1, 8), noise(11.3, 1.1, 8)); // tiling noise really tiles
   // Nothing within 1.4 km may rise above the seat, or it stops being an overlook.
   for (let a = 0; a < 6.28; a += 0.05) for (let r = 30; r <= 1400; r += 35) {
     if (height(Math.cos(a) * r, Math.sin(a) * r) > -20) throw new Error(`terrain blocks the view at r=${r}`);
@@ -97,133 +119,269 @@ if (location.hash === '#test') {
   document.title = 'tests ok';
 }
 
-// ---------- scene: no lights or textures, sunrise lighting is baked into vertex colours ----------
+// ---------- renderer ----------
+const buildStart = performance.now();
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.xr.enabled = true;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.autoUpdate = false; // nothing near you moves: render the shadow map once
 document.body.prepend(renderer.domElement);
 
-const HAZE = new THREE.Color('#e9c9b0');
 const scene = new THREE.Scene();
-scene.fog = new THREE.Fog(HAZE, 300, 5500);
-// near 0.3 keeps depth precision usable out at the far shoreline
-const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.3, 12000);
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 12000);
 camera.rotation.order = 'YXZ';
 camera.position.set(0, 1.5, 0);
 let yaw = 0, pitch = -0.1;
 camera.rotation.set(pitch, yaw, 0);
 
-const SUN = new THREE.Vector3(-0.2, 0.19, -0.96).normalize(); // direction towards the sun
-const AMBIENT = new THREE.Color(0.42, 0.47, 0.62), SUNLIGHT = new THREE.Color(0.95, 0.78, 0.6);
-const tri = new THREE.Triangle(), nrm = new THREE.Vector3(), mid = new THREE.Vector3();
-
-// Flat-shade a geometry: paint(centroid, normal) picks each face's base colour, the sun does the rest.
-function bake(geo, paint) {
-  if (geo.index) geo = geo.toNonIndexed();
-  const p = geo.attributes.position, col = new Float32Array(p.count * 3);
-  for (let i = 0; i < p.count; i += 3) {
-    tri.a.fromBufferAttribute(p, i); tri.b.fromBufferAttribute(p, i + 1); tri.c.fromBufferAttribute(p, i + 2);
-    tri.getNormal(nrm); tri.getMidpoint(mid);
-    const base = paint(mid, nrm), d = Math.max(0, nrm.dot(SUN));
-    for (let k = 0; k < 3; k++) {
-      col[(i + k) * 3] = base.r * (AMBIENT.r + SUNLIGHT.r * d);
-      col[(i + k) * 3 + 1] = base.g * (AMBIENT.g + SUNLIGHT.g * d);
-      col[(i + k) * 3 + 2] = base.b * (AMBIENT.b + SUNLIGHT.b * d);
-    }
-  }
-  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
-  return geo;
+const SUN = new THREE.Vector3(-0.2, 0.36, -0.93).normalize(); // direction towards the sun, about 20 degrees up
+const ANISO = Math.min(4, renderer.capabilities.getMaxAnisotropy());
+function dataTexture(data, w, h, srgb, wrap = THREE.RepeatWrapping) {
+  const t = new THREE.DataTexture(data, w, h, THREE.RGBAFormat);
+  if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = wrap;
+  t.magFilter = THREE.LinearFilter; t.minFilter = THREE.LinearMipmapLinearFilter;
+  t.generateMipmaps = true; t.anisotropy = ANISO; t.needsUpdate = true;
+  return t;
 }
-const baked = new THREE.MeshBasicMaterial({ vertexColors: true });
-const add = (geo, paint) => { const m = new THREE.Mesh(bake(geo, paint), baked); scene.add(m); return m; };
 
-const SNOW = new THREE.Color('#f2f0ee'), ROCK = new THREE.Color('#857970'), ROCK_DARK = new THREE.Color('#6e645e'),
-  MEADOW = new THREE.Color('#7d9a5c'), FOREST = new THREE.Color('#3f6b4a'), WHITE = new THREE.Color('#ffffff');
+// Tiling noise the shaders sample at several scales (a different pattern per channel).
+const NT = 256, noiseData = new Uint8Array(NT * NT * 4);
+for (let y = 0, i = 0; y < NT; y++) for (let x = 0; x < NT; x++, i += 4) {
+  const u = x / NT, v = y / NT;
+  noiseData[i] = 255 * fbm(u * 8, v * 8, 5, 8);
+  noiseData[i + 1] = 255 * fbm(u * 4 + 31, v * 4 + 17, 6, 4);
+  noiseData[i + 2] = 255 * fbm(u * 16 + 5, v * 16 + 71, 4, 16);
+  noiseData[i + 3] = 255 * fbm(u * 6 + 47, v * 6 + 3, 5, 6);
+}
+const U = { uBreath: { value: 0 }, uTime: { value: 0 }, tNoise: { value: dataTexture(noiseData, NT, NT, false) } };
 
-// Sky dome: haze at the horizon, blue overhead, warmer towards the sun.
-const SKY_R = 9000;
-const skyGeo = new THREE.SphereGeometry(SKY_R, 48, 32);
+// ---------- shaders: one sky model shared by the sky, the haze and the lake reflections ----------
+const g3 = v => `vec3(${v.x.toFixed(5)}, ${v.y.toFixed(5)}, ${v.z.toFixed(5)})`;
+const col = hex => { const c = new THREE.Color(hex); return `vec3(${c.r.toFixed(4)}, ${c.g.toFixed(4)}, ${c.b.toFixed(4)})`; };
+const VERT = `
+varying vec2 vUv; varying vec3 vW;
+void main() { vUv = uv; vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }`;
+const COMMON = `
+uniform float uBreath, uTime;
+uniform sampler2D tNoise;
+varying vec2 vUv; varying vec3 vW;
+const vec3 SUN = ${g3(SUN)};
+const vec3 SUNC = vec3(1.0, 0.84, 0.66);  // sunlight
+const vec3 AMB = vec3(0.30, 0.36, 0.50);   // skylight in the shade
+vec3 skyColor(vec3 d, float core, float glow) {
+  float h = max(d.y, 0.0), s = max(dot(d, SUN), 0.0);
+  vec3 c = mix(${col('#b7cfe8')}, ${col('#2c5a9c')}, pow(h, 0.55));
+  c = mix(c, ${col('#ffc48a')}, exp(-h * 6.0) * (0.12 + 0.7 * s * s));
+  // the glow around the sun widens and brightens with the in-breath
+  c += vec3(1.0, 0.8, 0.55) * (glow * 0.3 * pow(s, mix(16.0, 9.0, uBreath)) * (0.7 + 0.6 * uBreath) + core * 1.5 * pow(s, 300.0));
+  return c;
+}
+// Haze that is thicker down in the valley and takes the colour of the sky behind it.
+vec3 haze(vec3 c, vec3 w, float extra) {
+  vec3 rd = w - cameraPosition; float dist = length(rd); rd /= dist;
+  float t = rd.y * dist / 350.0;
+  float k = abs(t) < 0.001 ? dist : dist * (1.0 - exp(-t)) / t;
+  float f = 1.0 - exp(-0.0003 * exp(-(cameraPosition.y - (${WATER}.0)) / 350.0) * k);
+  return mix(c, skyColor(rd, 0.0, 0.4), max(f, extra));
+}`;
+const material = (fragment, uniforms = {}, extra = {}) => new THREE.ShaderMaterial({
+  vertexShader: VERT, fragmentShader: COMMON + fragment, uniforms: { ...U, ...uniforms }, ...extra });
+
+scene.add(new THREE.Mesh(new THREE.SphereGeometry(9000, 32, 16), material(`
+void main() {
+  vec3 d = normalize(vW - cameraPosition);
+  float s = dot(d, SUN);
+  vec3 c = skyColor(d, 1.0, 1.0) + vec3(1.0, 0.92, 0.8) * 4.0 * smoothstep(0.99988, 0.99996, s);
+  // thin high cirrus, drifting slowly
+  vec2 p = d.xz / (max(d.y, 0.0) + 0.12);
+  float w = texture2D(tNoise, p * 0.11 + uTime * 0.0006).r * texture2D(tNoise, p * vec2(0.31, 0.07) + 0.3).g;
+  w = smoothstep(0.27, 0.46, w) * smoothstep(0.03, 0.3, d.y);
+  c = mix(c, mix(vec3(0.95, 0.96, 1.0), vec3(1.0, 0.82, 0.62), pow(max(s, 0.0), 3.0)), w * 0.4);
+  gl_FragColor = vec4(c, 1.0);
+  #include <colorspace_fragment>
+}`, {}, { side: THREE.BackSide, depthWrite: false })));
+
+// ---------- terrain: heights, normals and cast shadows computed once, shaded per pixel ----------
+const N = 1024, SIZE = 6000, CELL = SIZE / N;
+const H = new Float32Array(N * N);
+let maxH = -Infinity;
+for (let r = 0, i = 0; r < N; r++) for (let c = 0; c < N; c++, i++) {
+  H[i] = height(-SIZE / 2 + (c + 0.5) * CELL, SIZE / 2 - (r + 0.5) * CELL);
+  if (H[i] > maxH) maxH = H[i];
+}
+const at = (c, r) => H[clamp(r, 0, N - 1) * N + clamp(c, 0, N - 1)];
+function sampleH(x, z) {
+  const fc = clamp((x + SIZE / 2) / CELL - 0.5, 0, N - 1.001), fr = clamp((SIZE / 2 - z) / CELL - 0.5, 0, N - 1.001);
+  const c = Math.floor(fc), r = Math.floor(fr), a = fc - c, b = fr - r, i = r * N + c;
+  return (H[i] * (1 - a) + H[i + 1] * a) * (1 - b) + (H[i + N] * (1 - a) + H[i + N + 1] * a) * b;
+}
+// Packed map: R,G = normal x,z; B = sunlit (0 in cast shadow); A = height above the lake, +-12.75 m.
+const mapData = new Uint8Array(N * N * 4);
 {
-  const p = skyGeo.attributes.position, col = [], c = new THREE.Color(), dir = new THREE.Vector3();
-  const LOW = new THREE.Color('#a9c3e0'), ZENITH = new THREE.Color('#3d68a8'), WARM = new THREE.Color('#ffd9a8');
-  for (let i = 0; i < p.count; i++) {
-    dir.fromBufferAttribute(p, i).divideScalar(SKY_R);
-    const t = Math.max(0, dir.y);
-    c.copy(HAZE).lerp(LOW, sm(0, 0.22, t)).lerp(ZENITH, sm(0.15, 1, t));
-    c.lerp(WARM, 0.6 * Math.max(0, dir.dot(SUN)) ** 4 * (1 - t));
-    col.push(c.r, c.g, c.b);
+  const flat = Math.hypot(SUN.x, SUN.z), sx = SUN.x / flat, sz = SUN.z / flat, rise = SUN.y / flat * CELL;
+  for (let r = 0, i = 0; r < N; r++) for (let c = 0; c < N; c++, i++) {
+    const h = H[i];
+    const dx = (at(c + 1, r) - at(c - 1, r)) / (2 * CELL), dz = (at(c, r - 1) - at(c, r + 1)) / (2 * CELL);
+    const inv = 1 / Math.hypot(dx, 1, dz);
+    // March towards the sun with growing steps; a near miss gives a soft shadow edge.
+    let lit = 1;
+    for (let d = 1.5; ; d = d * 1.06 + 0.6) {
+      const cc = Math.round(c + sx * d), rr = Math.round(r - sz * d), ray = h + 1 + rise * d;
+      if (cc < 0 || cc >= N || rr < 0 || rr >= N || ray > maxH) break;
+      const clear = ray - H[rr * N + cc];
+      if (clear <= 0) { lit = 0; break; }
+      lit = Math.min(lit, 24 * clear / (d * CELL));
+    }
+    mapData[i * 4] = 127.5 - 127.5 * dx * inv;
+    mapData[i * 4 + 1] = 127.5 - 127.5 * dz * inv;
+    mapData[i * 4 + 2] = 255 * lit;
+    mapData[i * 4 + 3] = clamp((h - WATER) / 25.5 + 0.5) * 255;
   }
-  skyGeo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
 }
-scene.add(new THREE.Mesh(skyGeo, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide, fog: false })));
-
-const sun = new THREE.Mesh(new THREE.CircleGeometry(170, 32), new THREE.MeshBasicMaterial({ color: '#fff1d0', fog: false }));
-sun.position.copy(SUN).multiplyScalar(7000);
-sun.lookAt(0, 0, 0);
-scene.add(sun);
-
-const haloCv = document.createElement('canvas'); haloCv.width = haloCv.height = 128;
-const hg = haloCv.getContext('2d'), grad = hg.createRadialGradient(64, 64, 0, 64, 64, 64);
-grad.addColorStop(0, 'rgba(255,228,180,.9)'); grad.addColorStop(0.3, 'rgba(255,215,165,.35)'); grad.addColorStop(1, 'rgba(255,215,165,0)');
-hg.fillStyle = grad; hg.fillRect(0, 0, 128, 128);
-const halo = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(haloCv),
-  blending: THREE.AdditiveBlending, depthTest: false, depthWrite: false, fog: false }));
-halo.position.copy(sun.position);
-halo.renderOrder = 10;
-scene.add(halo);
-
-// Terrain: 6 km square, 30 m cells (80k triangles, fine on a Quest 2).
-const terrainGeo = new THREE.PlaneGeometry(6000, 6000, 200, 200).rotateX(-Math.PI / 2);
+const SEG = 320; // 205k triangles; the fine detail comes from the per-pixel shading, not the mesh
+const terrainGeo = new THREE.PlaneGeometry(SIZE, SIZE, SEG, SEG).rotateX(-Math.PI / 2);
 {
   const p = terrainGeo.attributes.position;
-  for (let i = 0; i < p.count; i++) p.setY(i, height(p.getX(i), p.getZ(i)));
+  for (let i = 0; i < p.count; i++) p.setY(i, Math.max(sampleH(p.getX(i), p.getZ(i)), WATER));
 }
-add(terrainGeo, (m, n) => {
-  const v = noise(m.x / 90, m.z / 90);
-  if (m.y > 40 + 120 * v && n.y > 0.45) return SNOW;
-  if (n.y < 0.8 || m.y > -260 + 80 * v) return v > 0.5 ? ROCK : ROCK_DARK;
-  return v > 0.5 ? FOREST : MEADOW;
-});
+scene.add(new THREE.Mesh(terrainGeo, material(`
+uniform sampler2D tMap;
+float sat(float x) { return clamp(x, 0.0, 1.0); }
+const mat2 ROT = mat2(0.8, -0.6, 0.6, 0.8); // rotated samples hide the noise texture's repeat
+void main() {
+  vec4 m = texture2D(tMap, vUv);
+  vec3 n; n.xz = m.rg * 2.0 - 1.0; n.y = sqrt(max(0.02, 1.0 - dot(n.xz, n.xz)));
+  float up = n.y, wd = (m.a - 0.5) * 25.5;
+  vec4 nL = texture2D(tNoise, ROT * vW.xz / 2900.0); // landscape-scale variation
+  vec4 nA = texture2D(tNoise, vW.xz / 420.0);        // broad patches
+  vec4 nB = texture2D(tNoise, ROT * vW.xz / 53.0);   // tree- and boulder-sized detail
+  vec4 nC = texture2D(tNoise, vW.xz / 6.1);    // close grain; fades out with distance by itself
+  float grain = (nB.r - 0.5) + (nC.b - 0.5) * 0.6;
+  n = normalize(n + vec3(nB.g - 0.5, 0.0, nB.a - 0.5) * 0.22 + vec3(nC.r - 0.5, 0.0, nC.g - 0.5) * 0.3);
+  float h = vW.y + (nA.r - 0.5) * 120.0;
 
-const water = new THREE.Mesh(new THREE.CircleGeometry(3400, 48), new THREE.MeshBasicMaterial({ color: '#9fb9cc' }));
-water.rotation.x = -Math.PI / 2;
-water.position.y = WATER;
-scene.add(water);
+  vec3 meadow = mix(${col('#56773a')}, ${col('#9aa860')}, sat(nL.a * 1.6 + nA.g * 0.8 - 0.7)) * (0.85 + 0.3 * nC.b);
+  vec3 forest = ${col('#2a4a2e')} * (0.6 + 0.8 * nB.b);
+  float forestMask = smoothstep(0.46, 0.58, nL.g * 0.6 + nL.r * 0.4 + (nA.b - 0.5) * 0.3 + (nB.b - 0.5) * 0.35) * (1.0 - smoothstep(-320.0, -260.0, h)) * smoothstep(0.78, 0.90, up);
+  vec3 veg = mix(mix(meadow, forest, forestMask), ${col('#8c8558')}, smoothstep(-340.0, -250.0, h));
+  vec3 rock = mix(${col('#5f564f')}, ${col('#a1968a')}, sat(nB.g * 1.8 - 0.4)) * (0.8 + 0.4 * nA.a);
+  float rockMask = max(1.0 - smoothstep(0.70, 0.86, up + grain * 0.25), smoothstep(-300.0, -200.0, h + grain * 60.0));
+  float snowMask = smoothstep(20.0, 100.0, h + grain * 50.0) * smoothstep(0.45, 0.70, up + grain * 0.3);
+  vec3 albedo = mix(mix(veg, rock, rockMask), ${col('#f4f6fa')}, snowMask);
+  albedo = mix(albedo, ${col('#8f8468')} * 0.8, (1.0 - smoothstep(0.0, 2.5, wd)) * (1.0 - snowMask)); // wet shore
+  vec3 c = albedo * (SUNC * max(dot(n, SUN), 0.0) * m.b + AMB * (0.55 + 0.45 * n.y));
 
-// The summit you sit on: a flat-topped crag that flares down into the terrain below.
-const summitGeo = new THREE.CylinderGeometry(2.6, 60, 100, 11, 8).translate(0, -50, 0);
-{
-  const p = summitGeo.attributes.position;
-  for (let i = 0; i < p.count; i++) {
-    const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
-    if (Math.hypot(x, z) < 0.1) continue;
-    const k = 1 + (noise(x * 0.35 + 3, z * 0.35 + y * 0.9) - 0.5) * 0.5;
-    p.setXYZ(i, x * k, y < -0.01 && y > -99 ? y + (noise(x * 0.2 + 9, z * 0.2) - 0.5) * 3 : y, z * k);
+  if (wd < 0.3) { // lake: body colour by depth, sky reflection by viewing angle, glitter towards the sun
+    vec3 rd = normalize(vW - cameraPosition);
+    vec4 a = texture2D(tNoise, vW.xz / 70.0 + uTime * vec2(0.004, 0.002));
+    vec4 b = texture2D(tNoise, vW.xz / 19.0 - uTime * vec2(0.006, 0.009));
+    vec3 wn = normalize(vec3((a.r - 0.5) * 0.10 + (b.g - 0.5) * 0.06, 1.0, (a.g - 0.5) * 0.10 + (b.r - 0.5) * 0.06));
+    vec3 rf = reflect(rd, wn); rf.y = abs(rf.y);
+    float fres = 0.03 + 0.97 * pow(1.0 - max(dot(-rd, wn), 0.0), 5.0);
+    vec3 body = mix(${col('#3f8f8a')}, ${col('#12384a')}, smoothstep(0.0, 9.0, -wd)) * (AMB * 0.9 + SUNC * 0.5 * m.b);
+    c = mix(c, mix(body, skyColor(rf, m.b, 1.0), fres), smoothstep(0.3, -0.1, wd));
   }
+  // the far edge of the terrain dissolves completely into the haze
+  gl_FragColor = vec4(haze(c, vW, smoothstep(2500.0, 3000.0, length(vW.xz))), 1.0);
+  #include <colorspace_fragment>
+}`, { tMap: { value: dataTexture(mapData, N, N, false, THREE.ClampToEdgeWrapping) } })));
+
+// ---------- clouds: soft painted billboards beyond the ranges (you never leave the summit) ----------
+function cloudTexture(seed) {
+  const W = 256, Hh = 128, d = new Uint8Array(W * Hh * 4);
+  for (let y = 0, i = 0; y < Hh; y++) for (let x = 0; x < W; x++, i += 4) {
+    const u = x / W, v = y / Hh, nx = u * 2 - 1;
+    const e = nx * nx + (v > 0.3 ? ((v - 0.3) / 0.7) ** 2 : ((0.3 - v) / 0.3) ** 2); // flattish base, domed top
+    const dens = (1 - e) * 1.2 + (fbm(u * 5 + seed, v * 3 + seed * 1.7, 5) - 0.5) * 1.0;
+    const shade = 0.6 + 0.4 * sm(0.1, 0.8, v + (fbm(u * 8 + seed, v * 6, 3) - 0.5) * 0.4);
+    d[i] = 255 * (shade * 0.96); d[i + 1] = 255 * (shade * 0.97); d[i + 2] = 255 * Math.min(1, shade * 1.03);
+    d[i + 3] = 255 * sm(0.05, 0.6, dens) * (1 - sm(0.75, 1, e));
+  }
+  return dataTexture(d, W, Hh, true, THREE.ClampToEdgeWrapping);
 }
-add(summitGeo, (m, n) => (n.y > 0.9 ? ROCK : ROCK_DARK));
-
-// Loose stones and a small cairn: [x, z, size, y]
-const stones = [[1.9, -1.2, 0.35], [-2.0, -0.6, 0.28], [-1.5, 1.6, 0.4], [1.2, 2.0, 0.3], [2.2, 0.5, 0.22],
-  [-1.1, -1.9, 0.28], [-1.1, -1.9, 0.21, 0.3], [-1.08, -1.92, 0.15, 0.53], [-1.1, -1.9, 0.1, 0.7]];
-stones.forEach(([x, z, s, y = 0], i) => add(
-  new THREE.DodecahedronGeometry(s, 0).scale(1, 0.65, 1.2).rotateY(i * 1.7).translate(x, y + s * 0.4, z),
-  () => (i % 2 ? ROCK : ROCK_DARK)));
-
-// Low-poly clouds drifting around the far ranges.
+const cloudMats = [3, 11, 23].map(seed => material(`
+uniform sampler2D tCloud;
+void main() {
+  vec4 t = texture2D(tCloud, vUv);
+  float s = max(dot(normalize(vW - cameraPosition), SUN), 0.0);
+  vec3 c = t.rgb * (vec3(0.62, 0.68, 0.82) + SUNC * (0.45 + 1.1 * pow(s, 6.0)));
+  gl_FragColor = vec4(haze(c, vW, 0.0), t.a);
+  #include <colorspace_fragment>
+}`, { tCloud: { value: cloudTexture(seed) } }, { transparent: true, depthWrite: false }));
 const clouds = new THREE.Group();
-for (let i = 0; i < 12; i++) {
-  const g = new THREE.IcosahedronGeometry(1, 1), p = g.attributes.position;
-  for (let j = 0; j < p.count; j++) {
-    const k = 0.7 + 0.6 * fbm(p.getX(j) * 1.5 + i * 9, p.getY(j) * 1.5 + p.getZ(j) * 1.7);
-    p.setXYZ(j, p.getX(j) * k, p.getY(j) * k, p.getZ(j) * k);
-  }
-  const a = i * 2.4 + hash(i, 1), r = 1300 + 1500 * hash(i, 2), s = 90 + 130 * hash(i, 3);
-  g.scale(s * 1.8, s * 0.6, s).rotateY(a).translate(Math.cos(a) * r, -120 + 420 * hash(i, 4), Math.sin(a) * r);
-  clouds.add(new THREE.Mesh(bake(g, () => WHITE), baked));
+for (let i = 0; i < 16; i++) {
+  const a = i * 0.39 + hash(i, 1) * 0.2, r = 3300 + 1300 * hash(i, 2), w = 900 + 1300 * hash(i, 3);
+  const cloud = new THREE.Mesh(new THREE.PlaneGeometry(w, w / 2), cloudMats[i % 3]);
+  cloud.position.set(Math.cos(a) * r, 150 + 1100 * hash(i, 4) ** 2, Math.sin(a) * r);
+  cloud.lookAt(0, cloud.position.y, 0);
+  clouds.add(cloud);
 }
 scene.add(clouds);
+
+// ---------- the summit you sit on: real lights and shadows for the things within reach ----------
+const sunLight = new THREE.DirectionalLight('#ffe0bd', 3.2);
+sunLight.position.copy(SUN).multiplyScalar(30);
+sunLight.castShadow = true;
+sunLight.shadow.mapSize.set(2048, 2048);
+Object.assign(sunLight.shadow.camera, { left: -7, right: 7, top: 7, bottom: -7, near: 1, far: 60 });
+sunLight.shadow.bias = -0.0004; sunLight.shadow.normalBias = 0.03;
+scene.add(sunLight, new THREE.HemisphereLight('#a9c1ec', '#5c4d40', 1.4));
+
+const RT = 512, rockData = new Uint8Array(RT * RT * 4);
+for (let y = 0, i = 0; y < RT; y++) for (let x = 0; x < RT; x++, i += 4) {
+  const u = x / RT, v = y / RT;
+  const crack = Math.abs(2 * fbm(u * 5 + 40, v * 5 + 11, 5, 5) - 1);
+  let l = 0.55 + (fbm(u * 6, v * 6, 6, 6) - 0.5) * 0.9 + (noise(u * 128, v * 128, 128) - 0.5) * 0.18;
+  l *= 0.5 + 0.5 * sm(0, 0.1, crack);
+  const lichen = 0.3 * sm(0.6, 0.68, fbm(u * 9 + 3, v * 9 + 77, 4, 9));
+  rockData[i] = 255 * clamp(l * (0.98 - lichen * 0.1)); rockData[i + 1] = 255 * clamp(l * (0.93 + lichen * 0.1));
+  rockData[i + 2] = 255 * clamp(l * (0.87 - lichen * 0.5)); rockData[i + 3] = 255;
+}
+const rockTex = dataTexture(rockData, RT, RT, true);
+const rockMat = new THREE.MeshLambertMaterial({ map: rockTex, bumpMap: rockTex, bumpScale: 2 });
+function addRock(geo) {
+  geo.computeVertexNormals();
+  const m = new THREE.Mesh(geo, rockMat);
+  m.castShadow = m.receiveShadow = true;
+  scene.add(m);
+}
+
+// A level seat 2.2 m in radius, then crags falling away into the terrain below.
+const cragGeo = new THREE.RingGeometry(0.001, 1, 96, 56).rotateX(-Math.PI / 2);
+{
+  const p = cragGeo.attributes.position, uv = cragGeo.attributes.uv;
+  for (let i = 0; i < p.count; i++) {
+    const a = Math.atan2(p.getZ(i), p.getX(i)) + Math.PI / 2; // puts the mesh seam behind you
+    let R = 70 * Math.hypot(p.getX(i), p.getZ(i)) ** 2.4;      // rings packed densely near the seat
+    const out = sm(2.2, 7, R);
+    R *= 1 + out * 0.5 * (fbm(Math.cos(a) * 2.2 + 5 + R * 0.03, Math.sin(a) * 2.2 + 9, 4) - 0.5);
+    const x = Math.cos(a) * R, z = Math.sin(a) * R;
+    let y = (fbm(x * 0.9 + 3, z * 0.9 + 8, 3) - 0.5) * 0.05; // a few cm of unevenness underfoot
+    if (R > 2.2) y -= 1.5 * (R - 2.2) ** 1.15 * (0.75 + 0.5 * fbm(x * 0.12 + 20, z * 0.12 + 4, 3));
+    y += out * (fbm(x * 0.35 + 1, z * 0.35 + 2, 4) - 0.5) * 3;
+    p.setXYZ(i, x, y, z);
+    uv.setXY(i, (x + y * 0.7) / 3, (z + y * 0.7) / 3);
+  }
+}
+addRock(cragGeo);
+
+// Loose boulders and a small cairn: [x, z, size, y]
+[[1.9, -1.2, 0.35], [-2.0, -0.6, 0.28], [-1.5, 1.6, 0.4], [1.2, 2.0, 0.3], [2.2, 0.5, 0.22],
+  [-1.1, -1.9, 0.28], [-1.1, -1.9, 0.21, 0.3], [-1.08, -1.92, 0.15, 0.53], [-1.1, -1.9, 0.1, 0.7]].forEach(([x, z, s, y = 0], i) => {
+  const g = new THREE.SphereGeometry(1, 24, 16), p = g.attributes.position;
+  for (let j = 0; j < p.count; j++) {
+    const X = p.getX(j), Y = p.getY(j), Z = p.getZ(j);
+    const k = s * (1 + 0.5 * (fbm(X * 1.3 + i * 7.1, Y * 1.3 + Z * 1.9 + i * 3.3, 3) - 0.5));
+    p.setXYZ(j, X * k, Y * k * 0.62, Z * k * 1.15);
+  }
+  addRock(g.rotateY(i * 1.7).translate(x, y + s * 0.35, z));
+});
+renderer.shadowMap.needsUpdate = true;
+console.log(`mountain built in ${Math.round(performance.now() - buildStart)} ms`);
 
 // ---------- sound (all synthesised, no audio files) ----------
 let ctx, sound;
@@ -284,6 +442,8 @@ function bell() {
 
 // ---------- session ----------
 const ui = document.getElementById('ui'), endBtn = document.getElementById('end');
+document.getElementById('loading').hidden = true;
+document.getElementById('lengths').hidden = false;
 let running = false, t0 = 0, duration = 0, xrSession = null, vrOK = false;
 navigator.xr?.isSessionSupported('immersive-vr').then(ok => { vrOK = ok; }).catch(() => {});
 
@@ -331,8 +491,8 @@ addEventListener('resize', () => {
 
 renderer.setAnimationLoop(() => {
   const now = performance.now(), t = (running ? now - t0 : now) / 1000, b = breath(t);
-  halo.scale.setScalar(2200 + 900 * b);
-  halo.material.opacity = 0.55 + 0.35 * b;
+  U.uBreath.value = b;
+  U.uTime.value = now / 1000;
   clouds.rotation.y = now * 4e-7; // about 1 m/s out at the far ranges
   // Wind and drone open up on the in-breath, so the pace can be followed with eyes closed.
   if (sound) {

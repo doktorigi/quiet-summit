@@ -10,7 +10,7 @@ Sister app: [Quiet Orb](https://github.com/doktorigi/quiet-orb).
 
 ## Develop
 
-It is one file, `index.html`, with no build step. three.js loads from a CDN, the landscape is generated in code, and all sound is synthesised.
+It is one file, `index.html`, with no build step. three.js loads from a CDN and all sound is synthesised. The landscape is generated in code at load: heights, normals and cast shadows are computed once, then shaded per pixel (ground cover, lakes, haze and sky share one sky model). Only the summit rocks use real lights and a shadow map.
 
     python -m http.server 8766
 
